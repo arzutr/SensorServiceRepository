@@ -1,0 +1,6 @@
+create table sensor {
+id number,
+name varchar2(500),
+record_date date,
+record_user varchar2(500)
+};
