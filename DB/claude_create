@@ -1,0 +1,537 @@
+-- =====================================================================
+-- Composite Sensor Centric Model (Oracle PL/SQL)
+-- Gereksinim: Oracle 12c+ (identity kolonlar)
+-- DBMS_CRYPTO icin DBA'dan su yetki alinmali:
+--   GRANT EXECUTE ON SYS.DBMS_CRYPTO TO <sema_kullanicisi>;
+-- Hata kodlari:
+--   -20001 sensor yok        -20002 sensor kodu zaten var
+--   -20003 sensor DECOMMISSIONED (islem yapilamaz)
+--   -20004 gecerli OTA key yok
+--   -20005 sensor zaten bu composite icinde
+--   -20006 composite yok     -20007 gecersiz status
+--   -20008 composite kodu zaten var
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- 1) TABLOLAR
+-- ---------------------------------------------------------------------
+
+-- Sensorler (merkez tablo)
+CREATE TABLE sensors (
+  sensor_id    NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sensor_code  VARCHAR2(50)  NOT NULL,
+  sensor_name  VARCHAR2(200) NOT NULL,
+  sensor_type  VARCHAR2(50),
+  location     VARCHAR2(200),
+  status       VARCHAR2(20)  DEFAULT 'ACTIVE' NOT NULL,
+  created_at   TIMESTAMP     DEFAULT SYSTIMESTAMP NOT NULL,
+  updated_at   TIMESTAMP,
+  CONSTRAINT uq_sensors_code UNIQUE (sensor_code),
+  CONSTRAINT ck_sensors_status CHECK
+    (status IN ('ACTIVE','INACTIVE','FAULTY','MAINTENANCE','DECOMMISSIONED'))
+);
+
+-- Sensor status degisiklik gecmisi
+CREATE TABLE sensor_status_log (
+  log_id      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sensor_id   NUMBER NOT NULL REFERENCES sensors (sensor_id),
+  old_status  VARCHAR2(20),
+  new_status  VARCHAR2(20) NOT NULL,
+  reason      VARCHAR2(400),
+  changed_at  TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
+);
+
+-- OTA (over-the-air) key'ler: sensor basina versiyonlu, ayni anda tek ACTIVE key
+CREATE TABLE sensor_ota_keys (
+  key_id       NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sensor_id    NUMBER NOT NULL REFERENCES sensors (sensor_id),
+  key_version  NUMBER NOT NULL,
+  key_value    RAW(32) NOT NULL,                  -- 256 bit
+  status       VARCHAR2(10) DEFAULT 'ACTIVE' NOT NULL,
+  created_at   TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+  expires_at   TIMESTAMP,
+  revoked_at   TIMESTAMP,
+  CONSTRAINT ck_ota_status CHECK (status IN ('ACTIVE','REVOKED','EXPIRED')),
+  CONSTRAINT uq_ota_sensor_ver UNIQUE (sensor_id, key_version)
+);
+
+-- Bir sensorun ayni anda sadece 1 ACTIVE key'i olabilir
+CREATE UNIQUE INDEX uq_ota_one_active
+  ON sensor_ota_keys (CASE WHEN status = 'ACTIVE' THEN sensor_id END);
+
+-- Composite (birlestirilmis) sensorler - ayri tablo
+CREATE TABLE composite_sensors (
+  composite_id      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  composite_code    VARCHAR2(50)  NOT NULL,
+  composite_name    VARCHAR2(200) NOT NULL,
+  description       VARCHAR2(500),
+  aggregation_type  VARCHAR2(10)  DEFAULT 'AVG' NOT NULL,
+  status            VARCHAR2(20)  DEFAULT 'ACTIVE' NOT NULL,
+  created_at        TIMESTAMP     DEFAULT SYSTIMESTAMP NOT NULL,
+  updated_at        TIMESTAMP,
+  CONSTRAINT uq_composite_code UNIQUE (composite_code),
+  CONSTRAINT ck_composite_status CHECK (status IN ('ACTIVE','INACTIVE')),
+  CONSTRAINT ck_composite_aggr CHECK
+    (aggregation_type IN ('AVG','SUM','MIN','MAX','ANY','ALL'))
+);
+
+-- Composite <-> Sensor (N:M). Bir sensor birden fazla composite'te olabilir.
+CREATE TABLE composite_sensor_members (
+  composite_id  NUMBER NOT NULL REFERENCES composite_sensors (composite_id),
+  sensor_id     NUMBER NOT NULL REFERENCES sensors (sensor_id),
+  weight        NUMBER DEFAULT 1 NOT NULL,
+  added_at      TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+  CONSTRAINT pk_composite_members PRIMARY KEY (composite_id, sensor_id),
+  CONSTRAINT ck_member_weight CHECK (weight > 0)
+);
+
+CREATE INDEX ix_csm_sensor ON composite_sensor_members (sensor_id);
+
+-- Composite ozet gorunumu
+CREATE OR REPLACE VIEW v_composite_summary AS
+SELECT c.composite_id,
+       c.composite_code,
+       c.composite_name,
+       c.aggregation_type,
+       c.status,
+       COUNT(m.sensor_id)                         AS member_count,
+       COUNT(CASE WHEN s.status = 'ACTIVE' THEN 1 END) AS active_member_count
+FROM   composite_sensors c
+LEFT JOIN composite_sensor_members m ON m.composite_id = c.composite_id
+LEFT JOIN sensors s                  ON s.sensor_id    = m.sensor_id
+GROUP BY c.composite_id, c.composite_code, c.composite_name,
+         c.aggregation_type, c.status;
+
+-- ---------------------------------------------------------------------
+-- 2) PACKAGE SPEC
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE PACKAGE pkg_sensor AS
+
+  -- ===== Sensor =====
+  FUNCTION add_sensor (
+    p_code      VARCHAR2,
+    p_name      VARCHAR2,
+    p_type      VARCHAR2 DEFAULT NULL,
+    p_location  VARCHAR2 DEFAULT NULL,
+    p_status    VARCHAR2 DEFAULT 'ACTIVE'
+  ) RETURN NUMBER;
+
+  -- NULL gecilen alanlar degismez
+  PROCEDURE update_sensor (
+    p_sensor_id NUMBER,
+    p_name      VARCHAR2 DEFAULT NULL,
+    p_type      VARCHAR2 DEFAULT NULL,
+    p_location  VARCHAR2 DEFAULT NULL
+  );
+
+  PROCEDURE set_sensor_status (
+    p_sensor_id NUMBER,
+    p_status    VARCHAR2,
+    p_reason    VARCHAR2 DEFAULT NULL
+  );
+
+  -- ===== OTA Key =====
+  -- Eski ACTIVE key'i REVOKED yapar, yeni key uretir ve dondurur
+  FUNCTION rotate_ota_key (
+    p_sensor_id  NUMBER,
+    p_valid_days NUMBER DEFAULT 365
+  ) RETURN RAW;
+
+  PROCEDURE revoke_ota_key (p_sensor_id NUMBER);
+
+  FUNCTION get_active_ota_key (p_sensor_id NUMBER) RETURN RAW;
+
+  -- Suresi dolan ACTIVE key'leri EXPIRED yapar (DBMS_SCHEDULER ile calistirilabilir)
+  PROCEDURE expire_ota_keys;
+
+  -- ===== Composite =====
+  FUNCTION create_composite (
+    p_code         VARCHAR2,
+    p_name         VARCHAR2,
+    p_description  VARCHAR2 DEFAULT NULL,
+    p_aggregation  VARCHAR2 DEFAULT 'AVG'
+  ) RETURN NUMBER;
+
+  PROCEDURE update_composite (
+    p_composite_id NUMBER,
+    p_name         VARCHAR2 DEFAULT NULL,
+    p_description  VARCHAR2 DEFAULT NULL,
+    p_aggregation  VARCHAR2 DEFAULT NULL
+  );
+
+  PROCEDURE set_composite_status (
+    p_composite_id NUMBER,
+    p_status       VARCHAR2
+  );
+
+  PROCEDURE add_sensor_to_composite (
+    p_composite_id NUMBER,
+    p_sensor_id    NUMBER,
+    p_weight       NUMBER DEFAULT 1
+  );
+
+  PROCEDURE remove_sensor_from_composite (
+    p_composite_id NUMBER,
+    p_sensor_id    NUMBER
+  );
+
+  FUNCTION get_composite_sensors (p_composite_id NUMBER) RETURN SYS_REFCURSOR;
+
+  -- Sensor merkezli bakis: bu sensor hangi composite'lerde?
+  FUNCTION get_sensor_composites (p_sensor_id NUMBER) RETURN SYS_REFCURSOR;
+
+END pkg_sensor;
+/
+
+-- ---------------------------------------------------------------------
+-- 3) PACKAGE BODY
+-- Not: Paket COMMIT/ROLLBACK yapmaz, transaction'i cagiran yonetir.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE PACKAGE BODY pkg_sensor AS
+
+  -- ---------- private yardimcilar ----------
+  PROCEDURE check_sensor_status (p_status VARCHAR2) IS
+  BEGIN
+    IF p_status IS NULL OR p_status NOT IN
+       ('ACTIVE','INACTIVE','FAULTY','MAINTENANCE','DECOMMISSIONED') THEN
+      RAISE_APPLICATION_ERROR(-20007, 'Gecersiz sensor status: ' || p_status);
+    END IF;
+  END check_sensor_status;
+
+  PROCEDURE check_composite_status (p_status VARCHAR2) IS
+  BEGIN
+    IF p_status IS NULL OR p_status NOT IN ('ACTIVE','INACTIVE') THEN
+      RAISE_APPLICATION_ERROR(-20007, 'Gecersiz composite status: ' || p_status);
+    END IF;
+  END check_composite_status;
+
+  -- Sensor satirini kilitler ve mevcut status'u dondurur
+  FUNCTION lock_sensor (p_sensor_id NUMBER) RETURN VARCHAR2 IS
+    v_status sensors.status%TYPE;
+  BEGIN
+    SELECT status INTO v_status
+    FROM   sensors
+    WHERE  sensor_id = p_sensor_id
+    FOR UPDATE;
+    RETURN v_status;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      RAISE_APPLICATION_ERROR(-20001, 'Sensor bulunamadi: ' || p_sensor_id);
+  END lock_sensor;
+
+  PROCEDURE check_composite_exists (p_composite_id NUMBER) IS
+    v_cnt NUMBER;
+  BEGIN
+    SELECT COUNT(*) INTO v_cnt
+    FROM   composite_sensors
+    WHERE  composite_id = p_composite_id;
+    IF v_cnt = 0 THEN
+      RAISE_APPLICATION_ERROR(-20006, 'Composite bulunamadi: ' || p_composite_id);
+    END IF;
+  END check_composite_exists;
+
+  -- ================= SENSOR =================
+  FUNCTION add_sensor (
+    p_code      VARCHAR2,
+    p_name      VARCHAR2,
+    p_type      VARCHAR2 DEFAULT NULL,
+    p_location  VARCHAR2 DEFAULT NULL,
+    p_status    VARCHAR2 DEFAULT 'ACTIVE'
+  ) RETURN NUMBER IS
+    v_id     NUMBER;
+    v_status VARCHAR2(20) := UPPER(p_status);
+  BEGIN
+    check_sensor_status(v_status);
+
+    INSERT INTO sensors (sensor_code, sensor_name, sensor_type, location, status)
+    VALUES (UPPER(TRIM(p_code)), p_name, p_type, p_location, v_status)
+    RETURNING sensor_id INTO v_id;
+
+    INSERT INTO sensor_status_log (sensor_id, old_status, new_status, reason)
+    VALUES (v_id, NULL, v_status, 'Olusturuldu');
+
+    RETURN v_id;
+  EXCEPTION
+    WHEN DUP_VAL_ON_INDEX THEN
+      RAISE_APPLICATION_ERROR(-20002, 'Sensor kodu zaten var: ' || p_code);
+  END add_sensor;
+
+  PROCEDURE update_sensor (
+    p_sensor_id NUMBER,
+    p_name      VARCHAR2 DEFAULT NULL,
+    p_type      VARCHAR2 DEFAULT NULL,
+    p_location  VARCHAR2 DEFAULT NULL
+  ) IS
+    v_status sensors.status%TYPE;
+  BEGIN
+    v_status := lock_sensor(p_sensor_id);
+    IF v_status = 'DECOMMISSIONED' THEN
+      RAISE_APPLICATION_ERROR(-20003, 'Sensor DECOMMISSIONED, guncellenemez: ' || p_sensor_id);
+    END IF;
+
+    UPDATE sensors
+    SET    sensor_name = NVL(p_name, sensor_name),
+           sensor_type = NVL(p_type, sensor_type),
+           location    = NVL(p_location, location),
+           updated_at  = SYSTIMESTAMP
+    WHERE  sensor_id = p_sensor_id;
+  END update_sensor;
+
+  PROCEDURE set_sensor_status (
+    p_sensor_id NUMBER,
+    p_status    VARCHAR2,
+    p_reason    VARCHAR2 DEFAULT NULL
+  ) IS
+    v_new sensors.status%TYPE := UPPER(p_status);
+    v_old sensors.status%TYPE;
+  BEGIN
+    check_sensor_status(v_new);
+    v_old := lock_sensor(p_sensor_id);
+
+    IF v_old = 'DECOMMISSIONED' THEN
+      RAISE_APPLICATION_ERROR(-20003, 'Sensor DECOMMISSIONED, status degistirilemez: ' || p_sensor_id);
+    END IF;
+    IF v_old = v_new THEN
+      RETURN;  -- degisiklik yok
+    END IF;
+
+    UPDATE sensors
+    SET    status = v_new, updated_at = SYSTIMESTAMP
+    WHERE  sensor_id = p_sensor_id;
+
+    INSERT INTO sensor_status_log (sensor_id, old_status, new_status, reason)
+    VALUES (p_sensor_id, v_old, v_new, p_reason);
+
+    -- Kullanimdan kalkan sensorun key'i iptal edilir
+    IF v_new = 'DECOMMISSIONED' THEN
+      revoke_ota_key(p_sensor_id);
+    END IF;
+  END set_sensor_status;
+
+  -- ================= OTA KEY =================
+  FUNCTION rotate_ota_key (
+    p_sensor_id  NUMBER,
+    p_valid_days NUMBER DEFAULT 365
+  ) RETURN RAW IS
+    v_status  sensors.status%TYPE;
+    v_version NUMBER;
+    v_key     RAW(32);
+  BEGIN
+    v_status := lock_sensor(p_sensor_id);   -- satir kilidi: versiyon cakismasini onler
+    IF v_status = 'DECOMMISSIONED' THEN
+      RAISE_APPLICATION_ERROR(-20003, 'Sensor DECOMMISSIONED, key uretilemez: ' || p_sensor_id);
+    END IF;
+
+    UPDATE sensor_ota_keys
+    SET    status = 'REVOKED', revoked_at = SYSTIMESTAMP
+    WHERE  sensor_id = p_sensor_id AND status = 'ACTIVE';
+
+    SELECT NVL(MAX(key_version), 0) + 1
+    INTO   v_version
+    FROM   sensor_ota_keys
+    WHERE  sensor_id = p_sensor_id;
+
+    v_key := DBMS_CRYPTO.RANDOMBYTES(32);
+
+    INSERT INTO sensor_ota_keys (sensor_id, key_version, key_value, status, expires_at)
+    VALUES (p_sensor_id, v_version, v_key, 'ACTIVE',
+            SYSTIMESTAMP + NUMTODSINTERVAL(p_valid_days, 'DAY'));
+
+    RETURN v_key;
+  END rotate_ota_key;
+
+  PROCEDURE revoke_ota_key (p_sensor_id NUMBER) IS
+  BEGIN
+    UPDATE sensor_ota_keys
+    SET    status = 'REVOKED', revoked_at = SYSTIMESTAMP
+    WHERE  sensor_id = p_sensor_id AND status = 'ACTIVE';
+  END revoke_ota_key;
+
+  FUNCTION get_active_ota_key (p_sensor_id NUMBER) RETURN RAW IS
+    v_key RAW(32);
+  BEGIN
+    SELECT key_value
+    INTO   v_key
+    FROM   sensor_ota_keys
+    WHERE  sensor_id = p_sensor_id
+    AND    status = 'ACTIVE'
+    AND    (expires_at IS NULL OR expires_at > SYSTIMESTAMP);
+    RETURN v_key;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      RAISE_APPLICATION_ERROR(-20004, 'Gecerli OTA key yok: sensor ' || p_sensor_id);
+  END get_active_ota_key;
+
+  PROCEDURE expire_ota_keys IS
+  BEGIN
+    UPDATE sensor_ota_keys
+    SET    status = 'EXPIRED'
+    WHERE  status = 'ACTIVE'
+    AND    expires_at IS NOT NULL
+    AND    expires_at <= SYSTIMESTAMP;
+  END expire_ota_keys;
+
+  -- ================= COMPOSITE =================
+  FUNCTION create_composite (
+    p_code         VARCHAR2,
+    p_name         VARCHAR2,
+    p_description  VARCHAR2 DEFAULT NULL,
+    p_aggregation  VARCHAR2 DEFAULT 'AVG'
+  ) RETURN NUMBER IS
+    v_id NUMBER;
+  BEGIN
+    INSERT INTO composite_sensors
+      (composite_code, composite_name, description, aggregation_type)
+    VALUES
+      (UPPER(TRIM(p_code)), p_name, p_description, UPPER(p_aggregation))
+    RETURNING composite_id INTO v_id;
+    RETURN v_id;
+  EXCEPTION
+    WHEN DUP_VAL_ON_INDEX THEN
+      RAISE_APPLICATION_ERROR(-20008, 'Composite kodu zaten var: ' || p_code);
+  END create_composite;
+
+  PROCEDURE update_composite (
+    p_composite_id NUMBER,
+    p_name         VARCHAR2 DEFAULT NULL,
+    p_description  VARCHAR2 DEFAULT NULL,
+    p_aggregation  VARCHAR2 DEFAULT NULL
+  ) IS
+  BEGIN
+    UPDATE composite_sensors
+    SET    composite_name   = NVL(p_name, composite_name),
+           description      = NVL(p_description, description),
+           aggregation_type = NVL(UPPER(p_aggregation), aggregation_type),
+           updated_at       = SYSTIMESTAMP
+    WHERE  composite_id = p_composite_id;
+
+    IF SQL%ROWCOUNT = 0 THEN
+      RAISE_APPLICATION_ERROR(-20006, 'Composite bulunamadi: ' || p_composite_id);
+    END IF;
+  END update_composite;
+
+  PROCEDURE set_composite_status (
+    p_composite_id NUMBER,
+    p_status       VARCHAR2
+  ) IS
+    v_new VARCHAR2(20) := UPPER(p_status);
+  BEGIN
+    check_composite_status(v_new);
+
+    UPDATE composite_sensors
+    SET    status = v_new, updated_at = SYSTIMESTAMP
+    WHERE  composite_id = p_composite_id;
+
+    IF SQL%ROWCOUNT = 0 THEN
+      RAISE_APPLICATION_ERROR(-20006, 'Composite bulunamadi: ' || p_composite_id);
+    END IF;
+  END set_composite_status;
+
+  PROCEDURE add_sensor_to_composite (
+    p_composite_id NUMBER,
+    p_sensor_id    NUMBER,
+    p_weight       NUMBER DEFAULT 1
+  ) IS
+    v_status sensors.status%TYPE;
+  BEGIN
+    check_composite_exists(p_composite_id);
+
+    BEGIN
+      SELECT status INTO v_status FROM sensors WHERE sensor_id = p_sensor_id;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Sensor bulunamadi: ' || p_sensor_id);
+    END;
+
+    IF v_status = 'DECOMMISSIONED' THEN
+      RAISE_APPLICATION_ERROR(-20003, 'DECOMMISSIONED sensor composite\'e eklenemez: ' || p_sensor_id);
+    END IF;
+
+    BEGIN
+      INSERT INTO composite_sensor_members (composite_id, sensor_id, weight)
+      VALUES (p_composite_id, p_sensor_id, p_weight);
+    EXCEPTION
+      WHEN DUP_VAL_ON_INDEX THEN
+        RAISE_APPLICATION_ERROR(-20005, 'Sensor zaten bu composite icinde: ' || p_sensor_id);
+    END;
+  END add_sensor_to_composite;
+
+  PROCEDURE remove_sensor_from_composite (
+    p_composite_id NUMBER,
+    p_sensor_id    NUMBER
+  ) IS
+  BEGIN
+    DELETE FROM composite_sensor_members
+    WHERE  composite_id = p_composite_id
+    AND    sensor_id    = p_sensor_id;
+  END remove_sensor_from_composite;
+
+  FUNCTION get_composite_sensors (p_composite_id NUMBER) RETURN SYS_REFCURSOR IS
+    v_rc SYS_REFCURSOR;
+  BEGIN
+    OPEN v_rc FOR
+      SELECT s.sensor_id, s.sensor_code, s.sensor_name,
+             s.sensor_type, s.status, m.weight
+      FROM   composite_sensor_members m
+      JOIN   sensors s ON s.sensor_id = m.sensor_id
+      WHERE  m.composite_id = p_composite_id
+      ORDER  BY s.sensor_code;
+    RETURN v_rc;
+  END get_composite_sensors;
+
+  FUNCTION get_sensor_composites (p_sensor_id NUMBER) RETURN SYS_REFCURSOR IS
+    v_rc SYS_REFCURSOR;
+  BEGIN
+    OPEN v_rc FOR
+      SELECT c.composite_id, c.composite_code, c.composite_name,
+             c.aggregation_type, c.status, m.weight
+      FROM   composite_sensor_members m
+      JOIN   composite_sensors c ON c.composite_id = m.composite_id
+      WHERE  m.sensor_id = p_sensor_id
+      ORDER  BY c.composite_code;
+    RETURN v_rc;
+  END get_sensor_composites;
+
+END pkg_sensor;
+/
+
+-- ---------------------------------------------------------------------
+-- 4) ORNEK KULLANIM (test)
+-- ---------------------------------------------------------------------
+SET SERVEROUTPUT ON
+
+DECLARE
+  v_s1  NUMBER;
+  v_s2  NUMBER;
+  v_s3  NUMBER;
+  v_c1  NUMBER;
+  v_key RAW(32);
+BEGIN
+  -- Sensor ekle
+  v_s1 := pkg_sensor.add_sensor('TEMP-001', 'Sicaklik 1', 'TEMPERATURE', 'Oda A');
+  v_s2 := pkg_sensor.add_sensor('HUM-001',  'Nem 1',      'HUMIDITY',    'Oda A');
+  v_s3 := pkg_sensor.add_sensor('TEMP-002', 'Sicaklik 2', 'TEMPERATURE', 'Oda B');
+
+  -- Guncelle + status degistir
+  pkg_sensor.update_sensor(v_s1, p_location => 'Oda A - Tavan');
+  pkg_sensor.set_sensor_status(v_s2, 'MAINTENANCE', 'Kalibrasyon');
+
+  -- OTA key uret (tekrar cagrilirsa eski key iptal olur)
+  v_key := pkg_sensor.rotate_ota_key(v_s1, 90);
+  DBMS_OUTPUT.PUT_LINE('OTA key (hex): ' || RAWTOHEX(v_key));
+
+  -- Composite olustur ve sensorleri birlestir
+  v_c1 := pkg_sensor.create_composite('ROOM-A-ENV', 'Oda A Ortam', 'Sicaklik + Nem', 'AVG');
+  pkg_sensor.add_sensor_to_composite(v_c1, v_s1, 2);
+  pkg_sensor.add_sensor_to_composite(v_c1, v_s2, 1);
+  pkg_sensor.add_sensor_to_composite(v_c1, v_s3, 1);   -- ayni sensor baska composite'lerde de olabilir
+
+  COMMIT;
+  DBMS_OUTPUT.PUT_LINE('Tamam. Composite id: ' || v_c1);
+END;
+/
+
+-- Kontrol sorgulari
+-- SELECT * FROM v_composite_summary;
+-- SELECT * FROM sensor_status_log ORDER BY log_id;
+-- SELECT sensor_id, key_version, status, expires_at FROM sensor_ota_keys;
